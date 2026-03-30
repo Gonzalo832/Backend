@@ -4,6 +4,7 @@ const { syncEntregas } = require('../services/syncService');
 
 const router = express.Router();
 const asyncHandler = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+const REGISTROS_RETENCION_DIAS = 15;
 
 async function tableExists(tableName, connectionOrPool = pool) {
   const [rows] = await connectionOrPool.query(`SHOW TABLES LIKE '${tableName}'`);
@@ -25,6 +26,24 @@ async function getCatalogTableName(connectionOrPool = pool) {
   }
 
   throw new Error('No existe tabla de catalogo para lecheros');
+}
+
+async function purgeOldRegistros(connectionOrPool = pool) {
+  const diasPrevios = REGISTROS_RETENCION_DIAS - 1;
+
+  await connectionOrPool.execute(
+    `DELETE FROM registros_entrega
+     WHERE fecha < DATE_SUB(CURDATE(), INTERVAL ${diasPrevios} DAY)`
+  );
+}
+
+function parseIsoDate(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : null;
 }
 
 router.get('/health', asyncHandler(async (_req, res) => {
@@ -260,11 +279,65 @@ router.post('/sync/entregas', asyncHandler(async (req, res) => {
   }
 
   try {
+    await purgeOldRegistros();
     const syncedLocalIds = await syncEntregas(entregas);
     return res.json({ syncedLocalIds });
   } catch (error) {
     return res.status(500).json({ message: 'No se pudo sincronizar', detail: error.message });
   }
+}));
+
+router.get('/registros/quincena', asyncHandler(async (req, res) => {
+  const rutaId = Number(req.query.rutaId);
+  const lecheroId = Number(req.query.lecheroId);
+  const fechaHasta = parseIsoDate(req.query.fechaHasta) || new Date().toISOString().slice(0, 10);
+
+  if (!rutaId) {
+    return res.status(400).json({ message: 'rutaId es obligatorio' });
+  }
+
+  await purgeOldRegistros();
+
+  const tableName = await getCatalogTableName();
+  const fkLechero = await getEntregaLecheroColumn();
+  const filtroLechero = Number.isFinite(lecheroId) && lecheroId > 0 ? 'AND p.id = ?' : '';
+
+  const query = `
+    SELECT
+      p.id AS lecheroId,
+      p.nombre AS lechero,
+      DATE_FORMAT(re.fecha, '%Y-%m-%d') AS fecha,
+      SUM(re.litros_entregados) AS litros
+    FROM registros_entrega re
+    INNER JOIN ${tableName} p ON p.id = re.${fkLechero}
+    WHERE p.ruta_id = ?
+      AND re.fecha >= DATE_SUB(?, INTERVAL ${REGISTROS_RETENCION_DIAS - 1} DAY)
+      AND re.fecha <= ?
+      ${filtroLechero}
+    GROUP BY p.id, p.nombre, re.fecha
+    ORDER BY re.fecha DESC, p.nombre ASC
+  `;
+
+  const params = [rutaId, fechaHasta, fechaHasta];
+  if (filtroLechero) {
+    params.push(lecheroId);
+  }
+
+  const [rows] = await pool.execute(query, params);
+
+  return res.json({
+    diasMaximos: REGISTROS_RETENCION_DIAS,
+    fechaHasta,
+    fechaDesde: new Date(new Date(`${fechaHasta}T00:00:00`).getTime() - ((REGISTROS_RETENCION_DIAS - 1) * 24 * 60 * 60 * 1000))
+      .toISOString()
+      .slice(0, 10),
+    registros: rows.map((row) => ({
+      lecheroId: Number(row.lecheroId),
+      lechero: row.lechero,
+      fecha: row.fecha,
+      litros: Number(row.litros || 0),
+    })),
+  });
 }));
 
 router.get('/registros/hoy', asyncHandler(async (req, res) => {
