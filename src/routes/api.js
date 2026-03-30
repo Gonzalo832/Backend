@@ -267,15 +267,18 @@ router.post('/sync/entregas', asyncHandler(async (req, res) => {
 
   for (const entrega of entregas) {
     const lecheroId = entrega.lecheroId ?? entrega.productorId;
+    const dedupeKey = String(entrega.dedupeKey || '').trim();
     if (
       typeof entrega.localId !== 'number' ||
       typeof lecheroId !== 'number' ||
       typeof entrega.fecha !== 'string' ||
       typeof entrega.litrosEntregados !== 'number' ||
-      typeof entrega.dedupeKey !== 'string'
+      !dedupeKey
     ) {
       return res.status(400).json({ message: 'Estructura de entrega invalida' });
     }
+
+    entrega.dedupeKey = dedupeKey;
   }
 
   try {
@@ -363,13 +366,19 @@ router.get('/registros/hoy', asyncHandler(async (req, res) => {
       re.litros_entregados AS litrosEntregados,
       re.dedupe_key AS dedupeKey
     FROM registros_entrega re
+    INNER JOIN (
+      SELECT MAX(id) AS id
+      FROM registros_entrega
+      WHERE fecha = ?
+      GROUP BY ${fkLechero}, fecha
+    ) latest ON latest.id = re.id
     INNER JOIN ${tableName} p ON p.id = re.${fkLechero}
     WHERE p.ruta_id = ?
       AND re.fecha = ?
     ORDER BY re.id ASC
   `;
 
-  const [rows] = await pool.execute(query, [rutaId, fecha]);
+  const [rows] = await pool.execute(query, [fecha, rutaId, fecha]);
   return res.json(rows);
 }));
 

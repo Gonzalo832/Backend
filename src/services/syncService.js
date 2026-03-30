@@ -80,13 +80,36 @@ async function syncEntregas(entregas) {
 
     for (const entrega of entregas) {
       const lecheroId = entrega.lecheroId ?? entrega.productorId;
+      let existingId = null;
+      const dedupeKey = String(entrega.dedupeKey || '').trim();
 
-      const [existingRows] = await conn.execute(
-        'SELECT id FROM registros_entrega WHERE dedupe_key = ? LIMIT 1',
-        [entrega.dedupeKey]
-      );
+      if (dedupeKey) {
+        const [existingRows] = await conn.execute(
+          'SELECT id FROM registros_entrega WHERE dedupe_key = ? LIMIT 1',
+          [dedupeKey]
+        );
 
-      if (existingRows.length === 0) {
+        if (existingRows.length > 0) {
+          existingId = Number(existingRows[0].id);
+        }
+      }
+
+      if (!existingId) {
+        const [byDayRows] = await conn.execute(
+          `SELECT id
+           FROM registros_entrega
+           WHERE ${lecheroColumn} = ? AND fecha = ?
+           ORDER BY id DESC
+           LIMIT 1`,
+          [lecheroId, entrega.fecha]
+        );
+
+        if (byDayRows.length > 0) {
+          existingId = Number(byDayRows[0].id);
+        }
+      }
+
+      if (!existingId) {
         if (includeTrabajador) {
           const trabajadorId = await resolveTrabajadorId(conn, entrega, lecheroId);
           await conn.execute(
@@ -102,7 +125,7 @@ async function syncEntregas(entregas) {
               trabajadorId,
               entrega.fecha,
               entrega.litrosEntregados,
-              entrega.dedupeKey
+              dedupeKey || null
             ]
           );
         } else {
@@ -117,7 +140,7 @@ async function syncEntregas(entregas) {
               lecheroId,
               entrega.fecha,
               entrega.litrosEntregados,
-              entrega.dedupeKey
+              dedupeKey || null
             ]
           );
         }
@@ -128,14 +151,16 @@ async function syncEntregas(entregas) {
            SET ${lecheroColumn} = ?,
                trabajador_id = ?,
                fecha = ?,
-               litros_entregados = ?
-           WHERE dedupe_key = ?`,
+               litros_entregados = ?,
+               dedupe_key = ?
+           WHERE id = ?`,
           [
             lecheroId,
             trabajadorId,
             entrega.fecha,
             entrega.litrosEntregados,
-            entrega.dedupeKey
+            dedupeKey || null,
+            existingId
           ]
         );
       } else {
@@ -143,16 +168,30 @@ async function syncEntregas(entregas) {
           `UPDATE registros_entrega
            SET ${lecheroColumn} = ?,
                fecha = ?,
-               litros_entregados = ?
-           WHERE dedupe_key = ?`,
+               litros_entregados = ?,
+               dedupe_key = ?
+           WHERE id = ?`,
           [
             lecheroId,
             entrega.fecha,
             entrega.litrosEntregados,
-            entrega.dedupeKey
+            dedupeKey || null,
+            existingId
           ]
         );
       }
+
+      await conn.execute(
+        `DELETE FROM registros_entrega
+         WHERE ${lecheroColumn} = ? AND fecha = ? AND id <> (
+           SELECT id_keep FROM (
+             SELECT MAX(id) AS id_keep
+             FROM registros_entrega
+             WHERE ${lecheroColumn} = ? AND fecha = ?
+           ) t
+         )`,
+        [lecheroId, entrega.fecha, lecheroId, entrega.fecha]
+      );
 
       syncedLocalIds.push(entrega.localId);
     }
