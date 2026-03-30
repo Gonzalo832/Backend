@@ -394,13 +394,16 @@ router.get('/pagos/semanal', asyncHandler(async (req, res) => {
       SUM(re.litros_entregados) * COALESCE((SELECT precio_actual_litro FROM configuracion ORDER BY id ASC LIMIT 1), 0) AS totalPago
     FROM registros_entrega re
     INNER JOIN ${tableName} p ON p.id = re.${fkLechero}
-    WHERE YEARWEEK(re.fecha, 3) = YEARWEEK(?, 3)
+    WHERE re.fecha >= ?
+      AND re.fecha <= DATE_ADD(?, INTERVAL 6 DAY)
     ${routeFilter}
     GROUP BY p.id, p.nombre
     ORDER BY p.nombre ASC
   `;
 
-  const params = rutaId ? [fechaReferencia, rutaId] : [fechaReferencia];
+  const params = rutaId
+    ? [fechaReferencia, fechaReferencia, rutaId]
+    : [fechaReferencia, fechaReferencia];
   const [rows] = await pool.execute(query, params);
   return res.json(rows);
 }));
@@ -426,13 +429,14 @@ router.get('/pagos/semanal/detalle', asyncHandler(async (req, res) => {
       SUM(re.litros_entregados) AS litros
     FROM registros_entrega re
     INNER JOIN ${tableName} p ON p.id = re.${fkLechero}
-    WHERE YEARWEEK(re.fecha, 3) = YEARWEEK(?, 3)
+    WHERE re.fecha >= ?
+      AND re.fecha <= DATE_ADD(?, INTERVAL 6 DAY)
       AND p.ruta_id = ?
     GROUP BY p.id, re.fecha
     ORDER BY p.id ASC, re.fecha ASC
   `;
 
-  const [rows] = await pool.execute(query, [fechaReferencia, rutaId]);
+  const [rows] = await pool.execute(query, [fechaReferencia, fechaReferencia, rutaId]);
   return res.json(rows);
 }));
 
