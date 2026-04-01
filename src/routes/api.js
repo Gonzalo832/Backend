@@ -69,6 +69,84 @@ function parseIsoDate(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(trimmed) ? trimmed : null;
 }
 
+function isExpoPushToken(value) {
+  const token = String(value || '').trim();
+  return /^ExponentPushToken\[[^\]]+\]$/.test(token) || /^ExpoPushToken\[[^\]]+\]$/.test(token);
+}
+
+async function ensureAdminPushTokensTable(connectionOrPool = pool) {
+  await connectionOrPool.execute(
+    `CREATE TABLE IF NOT EXISTS admin_push_tokens (
+      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      admin_user_id BIGINT NULL,
+      admin_nombre VARCHAR(180) NULL,
+      expo_push_token VARCHAR(255) NOT NULL,
+      activo TINYINT(1) NOT NULL DEFAULT 1,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_admin_push_token (expo_push_token)
+    )`
+  );
+}
+
+async function getRutaNombreByLecheroId(lecheroId, connectionOrPool = pool) {
+  const tableName = await getCatalogTableName(connectionOrPool);
+  const [rows] = await connectionOrPool.execute(
+    `SELECT r.nombre
+     FROM ${tableName} l
+     INNER JOIN rutas r ON r.id = l.ruta_id
+     WHERE l.id = ?
+     LIMIT 1`,
+    [lecheroId]
+  );
+
+  return rows[0]?.nombre || null;
+}
+
+async function notifyAdminsLitrajesSincronizados({ rutaNombre, totalRegistros, totalLitros }) {
+  await ensureAdminPushTokensTable();
+
+  const [tokenRows] = await pool.execute(
+    `SELECT expo_push_token AS token
+     FROM admin_push_tokens
+     WHERE activo = 1`
+  );
+
+  const tokens = tokenRows
+    .map((row) => String(row.token || '').trim())
+    .filter((token) => isExpoPushToken(token));
+
+  if (tokens.length === 0) {
+    return;
+  }
+
+  const titulo = 'Litrajes sincronizados';
+  const cuerpo = `Se sincronizaron ${totalRegistros} registros (${totalLitros.toFixed(1)} L) de la ruta ${rutaNombre || 'sin nombre'}.`;
+
+  const messages = tokens.map((to) => ({
+    to,
+    sound: 'default',
+    title: titulo,
+    body: cuerpo,
+    data: {
+      tipo: 'sync_litrajes',
+      rutaNombre: rutaNombre || '',
+      totalRegistros,
+      totalLitros,
+      timestamp: new Date().toISOString(),
+    },
+  }));
+
+  await fetch('https://exp.host/--/api/v2/push/send', {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(messages),
+  });
+}
+
 router.get('/health', asyncHandler(async (_req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -307,10 +385,135 @@ router.post('/sync/entregas', asyncHandler(async (req, res) => {
   try {
     await purgeOldRegistros();
     const syncedLocalIds = await syncEntregas(entregas);
+
+    try {
+      const primerLecheroId = Number(entregas[0]?.lecheroId ?? entregas[0]?.productorId);
+      const rutaNombre = Number.isFinite(primerLecheroId) && primerLecheroId > 0
+        ? await getRutaNombreByLecheroId(primerLecheroId)
+        : null;
+      const totalLitros = entregas.reduce((acc, item) => acc + Number(item.litrosEntregados || 0), 0);
+
+      await notifyAdminsLitrajesSincronizados({
+        rutaNombre,
+        totalRegistros: syncedLocalIds.length,
+        totalLitros,
+      });
+    } catch (notifyError) {
+      console.error('No se pudo enviar notificacion push a administradores:', notifyError.message);
+    }
+
     return res.json({ syncedLocalIds });
   } catch (error) {
     return res.status(500).json({ message: 'No se pudo sincronizar', detail: error.message });
   }
+}));
+
+router.post('/notificaciones/admin-token', asyncHandler(async (req, res) => {
+  const token = String(req.body?.token || '').trim();
+  const adminUserId = req.body?.adminUserId === null || req.body?.adminUserId === undefined
+    ? null
+    : Number(req.body?.adminUserId);
+  const adminNombre = String(req.body?.adminNombre || '').trim() || null;
+
+  if (!isExpoPushToken(token)) {
+    return res.status(400).json({ message: 'token push invalido' });
+  }
+
+  if (adminUserId !== null && (!Number.isFinite(adminUserId) || adminUserId <= 0)) {
+    return res.status(400).json({ message: 'adminUserId invalido' });
+  }
+
+  await ensureAdminPushTokensTable();
+
+  await pool.execute(
+    `INSERT INTO admin_push_tokens (admin_user_id, admin_nombre, expo_push_token, activo)
+     VALUES (?, ?, ?, 1)
+     ON DUPLICATE KEY UPDATE
+       admin_user_id = VALUES(admin_user_id),
+       admin_nombre = VALUES(admin_nombre),
+       activo = 1`,
+    [adminUserId, adminNombre, token]
+  );
+
+  return res.json({ ok: true });
+}));
+
+router.post('/notificaciones/admin-token/remove', asyncHandler(async (req, res) => {
+  const token = String(req.body?.token || '').trim();
+
+  if (!isExpoPushToken(token)) {
+    return res.status(400).json({ message: 'token push invalido' });
+  }
+
+  await ensureAdminPushTokensTable();
+  await pool.execute('UPDATE admin_push_tokens SET activo = 0 WHERE expo_push_token = ?', [token]);
+
+  return res.json({ ok: true });
+}));
+
+router.get('/pedidos', asyncHandler(async (req, res) => {
+  const rutaId = Number(req.query.rutaId);
+  const fechaInicio = parseIsoDate(req.query.fechaInicio);
+  const fechaFin = parseIsoDate(req.query.fechaFin);
+
+  if (!Number.isFinite(rutaId) || rutaId <= 0) {
+    return res.status(400).json({ message: 'rutaId es obligatorio' });
+  }
+
+  await ensurePedidosTable();
+
+  const filtros = ['p.ruta_id = ?'];
+  const params = [rutaId];
+
+  if (fechaInicio) {
+    filtros.push('p.fecha_entrega >= ?');
+    params.push(fechaInicio);
+  }
+  if (fechaFin) {
+    filtros.push('p.fecha_entrega <= ?');
+    params.push(fechaFin);
+  }
+
+  const [rows] = await pool.execute(
+    `SELECT
+      p.id,
+      p.ruta_id AS rutaId,
+      p.lechero_id AS productorId,
+      p.nombre_cliente AS nombreCliente,
+      COALESCE(p.nota, '') AS nota,
+      DATE_FORMAT(p.fecha, '%Y-%m-%d') AS fecha,
+      DATE_FORMAT(p.fecha_entrega, '%Y-%m-%d') AS fechaEntrega,
+      p.kg_solicitado_fresco AS kgSolicitadoFresco,
+      p.kg_solicitado_hebra AS kgSolicitadoHebra,
+      p.kg_entregado_fresco AS kgEntregadoFresco,
+      p.kg_entregado_hebra AS kgEntregadoHebra,
+      p.dedupe_key AS dedupeKey,
+      p.independiente,
+      DATE_FORMAT(p.created_at, '%Y-%m-%d %H:%i:%s') AS createdAt
+     FROM pedidos p
+     WHERE ${filtros.join(' AND ')}
+     ORDER BY p.created_at DESC, p.id DESC`,
+    params
+  );
+
+  return res.json(
+    rows.map((row) => ({
+      id: Number(row.id),
+      rutaId: Number(row.rutaId),
+      productorId: row.productorId === null || row.productorId === undefined ? null : Number(row.productorId),
+      nombreCliente: row.nombreCliente,
+      nota: row.nota,
+      fecha: row.fecha,
+      fechaEntrega: row.fechaEntrega,
+      kgSolicitadoFresco: Number(row.kgSolicitadoFresco || 0),
+      kgSolicitadoHebra: Number(row.kgSolicitadoHebra || 0),
+      kgEntregadoFresco: row.kgEntregadoFresco === null || row.kgEntregadoFresco === undefined ? null : Number(row.kgEntregadoFresco),
+      kgEntregadoHebra: row.kgEntregadoHebra === null || row.kgEntregadoHebra === undefined ? null : Number(row.kgEntregadoHebra),
+      dedupeKey: String(row.dedupeKey || '').trim(),
+      independiente: Number(row.independiente || 0),
+      createdAt: row.createdAt,
+    }))
+  );
 }));
 
 router.post('/sync/pedidos', asyncHandler(async (req, res) => {
