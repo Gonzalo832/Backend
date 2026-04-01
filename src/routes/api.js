@@ -208,6 +208,17 @@ router.post('/rutas', asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'El nombre de la ruta es obligatorio' });
   }
 
+  // Idempotencia: si ya existe una ruta con el mismo nombre (sin importar mayusculas),
+  // devuelve la existente. Evita duplicados cuando el frontend reintenta por error de red.
+  const [existsRows] = await pool.execute(
+    'SELECT id, nombre FROM rutas WHERE LOWER(nombre) = LOWER(?) LIMIT 1',
+    [nombre]
+  );
+
+  if (existsRows.length > 0) {
+    return res.json(existsRows[0]);
+  }
+
   const [result] = await pool.execute(
     'INSERT INTO rutas (nombre) VALUES (?)',
     [nombre]
