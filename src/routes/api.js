@@ -60,6 +60,19 @@ async function purgeOldRegistros(connectionOrPool = pool) {
   );
 }
 
+async function purgeTrabajadoresByRuta(rutaId, connectionOrPool = pool) {
+  if (!(await tableExists('trabajadores', connectionOrPool))) {
+    return;
+  }
+
+  const [colRows] = await connectionOrPool.query("SHOW COLUMNS FROM trabajadores LIKE 'ruta_id'");
+  if (colRows.length === 0) {
+    return;
+  }
+
+  await connectionOrPool.execute('DELETE FROM trabajadores WHERE ruta_id = ?', [rutaId]);
+}
+
 function parseIsoDate(value) {
   if (typeof value !== 'string') {
     return null;
@@ -123,28 +136,75 @@ async function notifyAdminsLitrajesSincronizados({ rutaNombre, totalRegistros, t
   const titulo = 'Litrajes sincronizados';
   const cuerpo = `Se sincronizaron ${totalRegistros} registros (${totalLitros.toFixed(1)} L) de la ruta ${rutaNombre || 'sin nombre'}.`;
 
-  const messages = tokens.map((to) => ({
-    to,
-    sound: 'default',
-    title: titulo,
-    body: cuerpo,
-    data: {
-      tipo: 'sync_litrajes',
-      rutaNombre: rutaNombre || '',
-      totalRegistros,
-      totalLitros,
-      timestamp: new Date().toISOString(),
-    },
-  }));
+  const chunkSize = 100;
 
-  await fetch('https://exp.host/--/api/v2/push/send', {
-    method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(messages),
-  });
+  for (let i = 0; i < tokens.length; i += chunkSize) {
+    const tokensChunk = tokens.slice(i, i + chunkSize);
+    const messages = tokensChunk.map((to) => ({
+      to,
+      sound: 'default',
+      title: titulo,
+      body: cuerpo,
+      priority: 'high',
+      ttl: 60 * 60 * 24 * 3,
+      channelId: 'default',
+      data: {
+        tipo: 'sync_litrajes',
+        rutaNombre: rutaNombre || '',
+        totalRegistros,
+        totalLitros,
+        timestamp: new Date().toISOString(),
+      },
+    }));
+
+    const response = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(messages),
+    });
+
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok) {
+      throw new Error(`Expo push error HTTP ${response.status}`);
+    }
+
+    const tickets = Array.isArray(payload?.data) ? payload.data : [];
+    const tokensInvalidos = [];
+
+    for (let idx = 0; idx < tickets.length; idx += 1) {
+      const ticket = tickets[idx];
+      if (ticket?.status !== 'error') {
+        continue;
+      }
+
+      const token = tokensChunk[idx];
+      const errorCode = String(ticket?.details?.error || '');
+
+      if (errorCode === 'DeviceNotRegistered' && token) {
+        tokensInvalidos.push(token);
+      }
+
+      console.error('Expo push ticket error:', {
+        token,
+        errorCode,
+        message: ticket?.message,
+      });
+    }
+
+    if (tokensInvalidos.length > 0) {
+      const placeholders = tokensInvalidos.map(() => '?').join(',');
+      await pool.execute(
+        `UPDATE admin_push_tokens
+         SET activo = 0
+         WHERE expo_push_token IN (${placeholders})`,
+        tokensInvalidos
+      );
+    }
+  }
 }
 
 router.get('/health', asyncHandler(async (_req, res) => {
@@ -344,6 +404,9 @@ router.delete('/rutas/:id', asyncHandler(async (req, res) => {
        )`,
       [id]
     );
+    await purgeTrabajadoresByRuta(id, connection);
+    await ensurePedidosTable(connection);
+    await connection.execute('DELETE FROM pedidos WHERE ruta_id = ?', [id]);
     await connection.execute(`DELETE FROM ${tableName} WHERE ruta_id = ?`, [id]);
     await connection.execute('DELETE FROM rutas WHERE id = ?', [id]);
 
