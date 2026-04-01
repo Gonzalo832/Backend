@@ -28,6 +28,29 @@ async function getCatalogTableName(connectionOrPool = pool) {
   throw new Error('No existe tabla de catalogo para lecheros');
 }
 
+async function ensurePedidosTable(connectionOrPool = pool) {
+  await connectionOrPool.execute(
+    `CREATE TABLE IF NOT EXISTS pedidos (
+      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      ruta_id BIGINT NULL,
+      lechero_id BIGINT NULL,
+      nombre_cliente VARCHAR(180) NOT NULL,
+      nota TEXT NULL,
+      fecha DATE NOT NULL,
+      fecha_entrega DATE NULL,
+      kg_solicitado_fresco DECIMAL(10,3) NOT NULL DEFAULT 0,
+      kg_solicitado_hebra DECIMAL(10,3) NOT NULL DEFAULT 0,
+      kg_entregado_fresco DECIMAL(10,3) NULL,
+      kg_entregado_hebra DECIMAL(10,3) NULL,
+      independiente TINYINT(1) NOT NULL DEFAULT 0,
+      dedupe_key VARCHAR(255) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_pedidos_dedupe_key (dedupe_key)
+    )`
+  );
+}
+
 async function purgeOldRegistros(connectionOrPool = pool) {
   const diasPrevios = REGISTROS_RETENCION_DIAS - 1;
 
@@ -287,6 +310,128 @@ router.post('/sync/entregas', asyncHandler(async (req, res) => {
     return res.json({ syncedLocalIds });
   } catch (error) {
     return res.status(500).json({ message: 'No se pudo sincronizar', detail: error.message });
+  }
+}));
+
+router.post('/sync/pedidos', asyncHandler(async (req, res) => {
+  const pedidos = req.body?.pedidos;
+
+  if (!Array.isArray(pedidos) || pedidos.length === 0) {
+    return res.status(400).json({ message: 'pedidos debe ser un arreglo con al menos un registro' });
+  }
+
+  const connection = await pool.getConnection();
+  const syncedLocalIds = [];
+
+  try {
+    await connection.beginTransaction();
+    await ensurePedidosTable(connection);
+
+    for (const pedido of pedidos) {
+      const localId = Number(pedido.localId);
+      const dedupeKey = String(pedido.dedupeKey || '').trim();
+      const rutaId = Number(pedido.rutaId);
+      const lecheroId = pedido.productorId === null || pedido.productorId === undefined
+        ? null
+        : Number(pedido.productorId);
+      const nombreCliente = String(pedido.nombreCliente || '').trim();
+      const nota = String(pedido.nota || '').trim();
+      const fecha = parseIsoDate(pedido.fecha);
+      const fechaEntrega = parseIsoDate(pedido.fechaEntrega);
+      const kgSolicitadoFresco = Number(pedido.kgSolicitadoFresco || 0);
+      const kgSolicitadoHebra = Number(pedido.kgSolicitadoHebra || 0);
+      const kgEntregadoFresco = pedido.kgEntregadoFresco === null || pedido.kgEntregadoFresco === undefined || pedido.kgEntregadoFresco === ''
+        ? null
+        : Number(pedido.kgEntregadoFresco);
+      const kgEntregadoHebra = pedido.kgEntregadoHebra === null || pedido.kgEntregadoHebra === undefined || pedido.kgEntregadoHebra === ''
+        ? null
+        : Number(pedido.kgEntregadoHebra);
+      const independiente = Number(pedido.independiente) ? 1 : 0;
+
+      if (!Number.isFinite(localId) || localId <= 0) {
+        throw new Error('localId invalido en pedidos');
+      }
+      if (!Number.isFinite(rutaId) || rutaId <= 0) {
+        throw new Error('rutaId invalido en pedidos');
+      }
+      if (!dedupeKey) {
+        throw new Error('dedupeKey invalido en pedidos');
+      }
+      if (!nombreCliente) {
+        throw new Error('nombreCliente invalido en pedidos');
+      }
+      if (!fecha) {
+        throw new Error('fecha invalida en pedidos');
+      }
+      if (!fechaEntrega) {
+        throw new Error('fechaEntrega invalida en pedidos');
+      }
+      if (!Number.isFinite(kgSolicitadoFresco) || kgSolicitadoFresco < 0) {
+        throw new Error('kgSolicitadoFresco invalido en pedidos');
+      }
+      if (!Number.isFinite(kgSolicitadoHebra) || kgSolicitadoHebra < 0) {
+        throw new Error('kgSolicitadoHebra invalido en pedidos');
+      }
+      if (kgEntregadoFresco !== null && (!Number.isFinite(kgEntregadoFresco) || kgEntregadoFresco < 0)) {
+        throw new Error('kgEntregadoFresco invalido en pedidos');
+      }
+      if (kgEntregadoHebra !== null && (!Number.isFinite(kgEntregadoHebra) || kgEntregadoHebra < 0)) {
+        throw new Error('kgEntregadoHebra invalido en pedidos');
+      }
+
+      await connection.execute(
+        `INSERT INTO pedidos (
+          ruta_id,
+          lechero_id,
+          nombre_cliente,
+          nota,
+          fecha,
+          fecha_entrega,
+          kg_solicitado_fresco,
+          kg_solicitado_hebra,
+          kg_entregado_fresco,
+          kg_entregado_hebra,
+          independiente,
+          dedupe_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          ruta_id = VALUES(ruta_id),
+          lechero_id = VALUES(lechero_id),
+          nombre_cliente = VALUES(nombre_cliente),
+          nota = VALUES(nota),
+          fecha = VALUES(fecha),
+          fecha_entrega = VALUES(fecha_entrega),
+          kg_solicitado_fresco = VALUES(kg_solicitado_fresco),
+          kg_solicitado_hebra = VALUES(kg_solicitado_hebra),
+          kg_entregado_fresco = VALUES(kg_entregado_fresco),
+          kg_entregado_hebra = VALUES(kg_entregado_hebra),
+          independiente = VALUES(independiente)`,
+        [
+          rutaId,
+          lecheroId,
+          nombreCliente,
+          nota,
+          fecha,
+          fechaEntrega,
+          kgSolicitadoFresco,
+          kgSolicitadoHebra,
+          kgEntregadoFresco,
+          kgEntregadoHebra,
+          independiente,
+          dedupeKey,
+        ]
+      );
+
+      syncedLocalIds.push(localId);
+    }
+
+    await connection.commit();
+    return res.json({ syncedLocalIds });
+  } catch (error) {
+    await connection.rollback();
+    return res.status(500).json({ message: 'No se pudo sincronizar pedidos', detail: error.message });
+  } finally {
+    connection.release();
   }
 }));
 
