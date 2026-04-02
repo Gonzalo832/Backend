@@ -67,6 +67,20 @@ async function ensurePagosConfiguracionTable(connectionOrPool = pool) {
   );
 }
 
+async function ensureTiposPagoLecheroTable(connectionOrPool = pool) {
+  await connectionOrPool.execute(
+    `CREATE TABLE IF NOT EXISTS pagos_tipo_lechero (
+      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      ruta_id BIGINT NOT NULL,
+      lechero_id BIGINT NOT NULL,
+      tipo_pago ENUM('efectivo', 'transferencia') NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_tipo_pago_lechero (ruta_id, lechero_id)
+    )`
+  );
+}
+
 function normalizePagosConfigPayload(body = {}) {
   const precioPorLitroRaw = body.precioPorLitro;
   const precioPorLitro = precioPorLitroRaw === '' || precioPorLitroRaw === null || precioPorLitroRaw === undefined
@@ -397,6 +411,9 @@ router.delete('/lecheros/:id', asyncHandler(async (req, res) => {
       `DELETE FROM registros_entrega WHERE ${entregaColumn} = ?`,
       [id]
     );
+    if (await tableExists('pagos_tipo_lechero', connection)) {
+      await connection.execute('DELETE FROM pagos_tipo_lechero WHERE lechero_id = ?', [id]);
+    }
     await connection.execute('DELETE FROM lecheros WHERE id = ?', [id]);
 
     await connection.commit();
@@ -743,6 +760,88 @@ router.post('/sync/pedidos', asyncHandler(async (req, res) => {
   } catch (error) {
     await connection.rollback();
     return res.status(500).json({ message: 'No se pudo sincronizar pedidos', detail: error.message });
+  } finally {
+    connection.release();
+  }
+}));
+
+router.get('/tipos-pago', asyncHandler(async (req, res) => {
+  const rutaId = Number(req.query.rutaId);
+
+  if (!Number.isFinite(rutaId) || rutaId <= 0) {
+    return res.status(400).json({ message: 'rutaId es obligatorio' });
+  }
+
+  await ensureTiposPagoLecheroTable();
+  const tableName = await getCatalogTableName();
+
+  const [rows] = await pool.execute(
+    `SELECT
+      tp.lechero_id AS productorId,
+      tp.tipo_pago AS tipoPago
+     FROM pagos_tipo_lechero tp
+     INNER JOIN ${tableName} l
+       ON l.id = tp.lechero_id
+      AND l.ruta_id = tp.ruta_id
+     WHERE tp.ruta_id = ?`,
+    [rutaId]
+  );
+
+  const tiposPago = rows.reduce((acc, row) => {
+    const productorId = Number(row.productorId);
+    const tipoPago = String(row.tipoPago || '').trim();
+
+    if (Number.isFinite(productorId) && productorId > 0 && (tipoPago === 'efectivo' || tipoPago === 'transferencia')) {
+      acc[productorId] = tipoPago;
+    }
+
+    return acc;
+  }, {});
+
+  return res.json({ rutaId, tiposPago });
+}));
+
+router.post('/sync/tipos-pago', asyncHandler(async (req, res) => {
+  const tiposPago = req.body?.tiposPago;
+
+  if (!Array.isArray(tiposPago) || tiposPago.length === 0) {
+    return res.status(400).json({ message: 'tiposPago debe ser un arreglo con al menos un registro' });
+  }
+
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+    await ensureTiposPagoLecheroTable(connection);
+
+    for (const item of tiposPago) {
+      const rutaId = Number(item?.rutaId);
+      const productorId = Number(item?.productorId);
+      const tipoPago = String(item?.tipoPago || '').trim();
+
+      if (!Number.isFinite(rutaId) || rutaId <= 0) {
+        throw new Error('rutaId invalido en tiposPago');
+      }
+      if (!Number.isFinite(productorId) || productorId <= 0) {
+        throw new Error('productorId invalido en tiposPago');
+      }
+      if (tipoPago !== 'efectivo' && tipoPago !== 'transferencia') {
+        throw new Error('tipoPago invalido en tiposPago');
+      }
+
+      await connection.execute(
+        `INSERT INTO pagos_tipo_lechero (ruta_id, lechero_id, tipo_pago)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE tipo_pago = VALUES(tipo_pago)`,
+        [rutaId, productorId, tipoPago]
+      );
+    }
+
+    await connection.commit();
+    return res.json({ ok: true });
+  } catch (error) {
+    await connection.rollback();
+    return res.status(500).json({ message: 'No se pudo sincronizar tipos de pago', detail: error.message });
   } finally {
     connection.release();
   }
