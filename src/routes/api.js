@@ -51,6 +51,42 @@ async function ensurePedidosTable(connectionOrPool = pool) {
   );
 }
 
+async function ensurePagosConfiguracionTable(connectionOrPool = pool) {
+  await connectionOrPool.execute(
+    `CREATE TABLE IF NOT EXISTS pagos_configuracion_semanal (
+      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      ruta_id BIGINT NOT NULL,
+      semana_inicio DATE NOT NULL,
+      precio_ruta DECIMAL(10,2) NULL,
+      descuentos_json LONGTEXT NULL,
+      precios_especiales_json LONGTEXT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_pagos_configuracion_semanal (ruta_id, semana_inicio)
+    )`
+  );
+}
+
+function normalizePagosConfigPayload(body = {}) {
+  const precioPorLitroRaw = body.precioPorLitro;
+  const precioPorLitro = precioPorLitroRaw === '' || precioPorLitroRaw === null || precioPorLitroRaw === undefined
+    ? null
+    : Number(precioPorLitroRaw);
+
+  if (precioPorLitro !== null && (!Number.isFinite(precioPorLitro) || precioPorLitro <= 0)) {
+    throw new Error('precioPorLitro debe ser un numero mayor a 0');
+  }
+
+  const descuentos = body.descuentos && typeof body.descuentos === 'object' ? body.descuentos : {};
+  const preciosEspeciales = body.preciosEspeciales && typeof body.preciosEspeciales === 'object' ? body.preciosEspeciales : {};
+
+  return {
+    precioPorLitro,
+    descuentos: JSON.stringify(descuentos),
+    preciosEspeciales: JSON.stringify(preciosEspeciales),
+  };
+}
+
 async function purgeOldRegistros(connectionOrPool = pool) {
   const diasPrevios = REGISTROS_RETENCION_DIAS - 1;
 
@@ -869,6 +905,109 @@ router.get('/pagos/semanal/detalle', asyncHandler(async (req, res) => {
 
   const [rows] = await pool.execute(query, [fechaReferencia, fechaReferencia, rutaId]);
   return res.json(rows);
+}));
+
+router.get('/pagos/configuracion', asyncHandler(async (req, res) => {
+  const rutaId = Number(req.query.rutaId);
+  const semanaInicio = parseIsoDate(req.query.semanaInicio);
+
+  if (!rutaId) {
+    return res.status(400).json({ message: 'rutaId es obligatorio' });
+  }
+
+  if (!semanaInicio) {
+    return res.status(400).json({ message: 'semanaInicio es obligatoria, ejemplo: 2026-04-02' });
+  }
+
+  await ensurePagosConfiguracionTable();
+
+  const [rows] = await pool.execute(
+    `SELECT
+      ruta_id AS rutaId,
+      DATE_FORMAT(semana_inicio, '%Y-%m-%d') AS semanaInicio,
+      precio_ruta AS precioPorLitro,
+      descuentos_json AS descuentosJson,
+      precios_especiales_json AS preciosEspecialesJson
+     FROM pagos_configuracion_semanal
+     WHERE ruta_id = ? AND semana_inicio = ?
+     LIMIT 1`,
+    [rutaId, semanaInicio]
+  );
+
+  const row = rows[0];
+
+  let descuentos = {};
+  let preciosEspeciales = {};
+
+  try {
+    descuentos = row?.descuentosJson ? JSON.parse(row.descuentosJson) : {};
+  } catch (_) {
+    descuentos = {};
+  }
+
+  try {
+    preciosEspeciales = row?.preciosEspecialesJson ? JSON.parse(row.preciosEspecialesJson) : {};
+  } catch (_) {
+    preciosEspeciales = {};
+  }
+
+  return res.json({
+    rutaId,
+    semanaInicio,
+    precioPorLitro: row?.precioPorLitro === null || row?.precioPorLitro === undefined ? '' : String(row.precioPorLitro),
+    descuentos,
+    preciosEspeciales,
+  });
+}));
+
+router.put('/pagos/configuracion', asyncHandler(async (req, res) => {
+  const rutaId = Number(req.body?.rutaId);
+  const semanaInicio = parseIsoDate(req.body?.semanaInicio);
+
+  if (!rutaId) {
+    return res.status(400).json({ message: 'rutaId es obligatorio' });
+  }
+
+  if (!semanaInicio) {
+    return res.status(400).json({ message: 'semanaInicio es obligatoria, ejemplo: 2026-04-02' });
+  }
+
+  let payload;
+  try {
+    payload = normalizePagosConfigPayload(req.body);
+  } catch (error) {
+    return res.status(400).json({ message: error.message || 'Configuracion invalida' });
+  }
+
+  await ensurePagosConfiguracionTable();
+
+  await pool.execute(
+    `INSERT INTO pagos_configuracion_semanal (
+      ruta_id,
+      semana_inicio,
+      precio_ruta,
+      descuentos_json,
+      precios_especiales_json
+    ) VALUES (?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      precio_ruta = VALUES(precio_ruta),
+      descuentos_json = VALUES(descuentos_json),
+      precios_especiales_json = VALUES(precios_especiales_json)`,
+    [
+      rutaId,
+      semanaInicio,
+      payload.precioPorLitro,
+      payload.descuentos,
+      payload.preciosEspeciales,
+    ]
+  );
+
+  return res.json({
+    ok: true,
+    rutaId,
+    semanaInicio,
+    precioPorLitro: payload.precioPorLitro === null ? '' : String(payload.precioPorLitro),
+  });
 }));
 
 router.get('/configuracion/precio', asyncHandler(async (_req, res) => {
