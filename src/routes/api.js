@@ -81,6 +81,21 @@ async function ensureTiposPagoLecheroTable(connectionOrPool = pool) {
   );
 }
 
+async function ensurePreciosQuesosTable(connectionOrPool = pool) {
+  await connectionOrPool.execute(
+    `CREATE TABLE IF NOT EXISTS precios_quesos_semanal (
+      id BIGINT PRIMARY KEY AUTO_INCREMENT,
+      ruta_id BIGINT NOT NULL,
+      semana_inicio DATE NOT NULL,
+      precio_fresco DECIMAL(10,2) NOT NULL DEFAULT 0,
+      precio_hebra DECIMAL(10,2) NOT NULL DEFAULT 0,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uk_precios_quesos_semanal (ruta_id, semana_inicio)
+    )`
+  );
+}
+
 function normalizePagosConfigPayload(body = {}) {
   const precioPorLitroRaw = body.precioPorLitro;
   const precioPorLitro = precioPorLitroRaw === '' || precioPorLitroRaw === null || precioPorLitroRaw === undefined
@@ -760,6 +775,95 @@ router.post('/sync/pedidos', asyncHandler(async (req, res) => {
   } catch (error) {
     await connection.rollback();
     return res.status(500).json({ message: 'No se pudo sincronizar pedidos', detail: error.message });
+  } finally {
+    connection.release();
+  }
+}));
+
+router.get('/precios-quesos', asyncHandler(async (req, res) => {
+  const rutaId = Number(req.query.rutaId);
+  const fechaInicio = parseIsoDate(req.query.fechaInicio);
+
+  if (!Number.isFinite(rutaId) || rutaId <= 0) {
+    return res.status(400).json({ message: 'rutaId es obligatorio' });
+  }
+  if (!fechaInicio) {
+    return res.status(400).json({ message: 'fechaInicio es obligatoria, ejemplo: 2026-04-02' });
+  }
+
+  await ensurePreciosQuesosTable();
+
+  const [rows] = await pool.execute(
+    `SELECT
+      ruta_id AS rutaId,
+      DATE_FORMAT(semana_inicio, '%Y-%m-%d') AS semanaInicio,
+      precio_fresco AS precioFresco,
+      precio_hebra AS precioHebra
+     FROM precios_quesos_semanal
+     WHERE ruta_id = ?
+       AND semana_inicio <= ?
+     ORDER BY semana_inicio DESC
+     LIMIT 1`,
+    [rutaId, fechaInicio]
+  );
+
+  const row = rows[0];
+
+  return res.json({
+    rutaId,
+    semanaInicio: row?.semanaInicio || fechaInicio,
+    precioFresco: Number(row?.precioFresco || 0),
+    precioHebra: Number(row?.precioHebra || 0),
+  });
+}));
+
+router.post('/sync/precios-quesos', asyncHandler(async (req, res) => {
+  const preciosQuesos = req.body?.preciosQuesos;
+
+  if (!Array.isArray(preciosQuesos) || preciosQuesos.length === 0) {
+    return res.status(400).json({ message: 'preciosQuesos debe ser un arreglo con al menos un registro' });
+  }
+
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+    await ensurePreciosQuesosTable(connection);
+
+    for (const item of preciosQuesos) {
+      const rutaId = Number(item?.rutaId);
+      const semanaInicio = parseIsoDate(item?.semanaInicio);
+      const precioFresco = Number(item?.precioFresco || 0);
+      const precioHebra = Number(item?.precioHebra || 0);
+
+      if (!Number.isFinite(rutaId) || rutaId <= 0) {
+        throw new Error('rutaId invalido en preciosQuesos');
+      }
+      if (!semanaInicio) {
+        throw new Error('semanaInicio invalida en preciosQuesos');
+      }
+      if (!Number.isFinite(precioFresco) || precioFresco < 0) {
+        throw new Error('precioFresco invalido en preciosQuesos');
+      }
+      if (!Number.isFinite(precioHebra) || precioHebra < 0) {
+        throw new Error('precioHebra invalido en preciosQuesos');
+      }
+
+      await connection.execute(
+        `INSERT INTO precios_quesos_semanal (ruta_id, semana_inicio, precio_fresco, precio_hebra)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           precio_fresco = VALUES(precio_fresco),
+           precio_hebra = VALUES(precio_hebra)`,
+        [rutaId, semanaInicio, precioFresco, precioHebra]
+      );
+    }
+
+    await connection.commit();
+    return res.json({ ok: true });
+  } catch (error) {
+    await connection.rollback();
+    return res.status(500).json({ message: 'No se pudo sincronizar precios de queso', detail: error.message });
   } finally {
     connection.release();
   }
