@@ -658,6 +658,26 @@ router.get('/pedidos', asyncHandler(async (req, res) => {
   );
 }));
 
+router.delete('/pedidos/by-dedupe/:dedupeKey', asyncHandler(async (req, res) => {
+  const dedupeKey = String(req.params?.dedupeKey || '').trim();
+
+  if (!dedupeKey) {
+    return res.status(400).json({ message: 'dedupeKey es obligatorio' });
+  }
+
+  await ensurePedidosTable();
+
+  const [result] = await pool.execute(
+    'DELETE FROM pedidos WHERE dedupe_key = ? LIMIT 1',
+    [dedupeKey]
+  );
+
+  return res.json({
+    ok: true,
+    deletedCount: Number(result?.affectedRows || 0),
+  });
+}));
+
 router.post('/sync/pedidos', asyncHandler(async (req, res) => {
   const pedidos = req.body?.pedidos;
 
